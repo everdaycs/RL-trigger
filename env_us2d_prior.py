@@ -5,6 +5,8 @@
 # - Random start pose (x, y, yaw)
 # - Partial prior map (a portion of the true map revealed)
 # - Cone-style FoV via multiple sub-rays per trigger
+# - (NEW) Optional boundary walls enclosing the map
+# - (NEW) Optional robot motion during ping round-trip time window dt
 #
 # Notes:
 # - No IMU preintegration modeling here.
@@ -44,13 +46,30 @@ class EnvConfig:
     # Grid (discrete map used for sensing updates & coverage)
     map_size_m: float = 12.0                # [m] square map size
     map_res: float = 0.1                    # [m] cell resolution
-    prior_known_ratio: float = 0.35         # fraction of cells to reveal as prior
-    prior_noise_flip_prob: float = 0.02     # small fraction of prior cells flipped to simulate errors
-    episode_max_steps: int = 400
+    prior_known_ratio: float = 0.2        # fraction of cells to reveal as prior
+    prior_noise_flip_prob: float = 0.01     # small fraction of prior cells flipped to simulate errors
+    episode_max_steps: int = 129
     coverage_stop: float = 0.9
 
     # FoV rasterization
     subrays_per_fov: int = 9                # number of sub-rays across FoV cone
+
+    # (NEW) Boundary wall
+    with_boundary: bool = True              # add 1-cell-thick walls around map
+
+    # (NEW) Robot motion during ping time window dt (simple unicycle)
+    motion_enabled: bool = True             # enable pose propagation over dt
+    v_lin_mean: float = 0.10                # mean linear velocity [m/s]
+    v_lin_std:  float = 0.05                # std  linear velocity [m/s]
+    v_ang_mean: float = 0.0                 # mean angular velocity [rad/s]
+    v_ang_std:  float = 0.20                # std  angular velocity [rad/s]
+    motion_substeps: int = 5                # Euler sub-steps to avoid tunneling
+    keep_inside: bool = True                # handle out-of-bounds/collision
+    collide_stop: bool = True               # stop remaining motion on collision
+    
+    # ---- Prior options (NEW) ----
+    prior_mode: str = "local_disk"        # "global" | "local_disk"
+    prior_local_radius_m: float = 3.0 # 局部先验半径（以机器人为圆心）
 
 # =========================
 # ======  UTILITIES  ======
@@ -80,8 +99,7 @@ def in_bounds(r: int, c: int, H: int, W: int) -> bool:
 # Bresenham-like ray traversal on grid
 def raycast_grid(x0: float, y0: float, theta: float, max_range: float, H: int, W: int, res: float):
     """Yield grid indices (r,c) along a ray from (x0,y0) until max_range."""
-    # Step world in small increments of res/2 to be robust
-    step = res * 0.5
+    step = res * 0.5  # robust small steps
     dx, dy = math.cos(theta) * step, math.sin(theta) * step
     n_steps = int(max_range / step) + 1
     x, y = x0, y0
@@ -109,6 +127,8 @@ class US2DPriorEnv:
     """
     Global grid + random start pose + prior reveal.
     Sensing uses cone FoV via multiple sub-rays.
+    (NEW) Optional boundary walls.
+    (NEW) Optional robot motion during ping time window dt.
     """
     def __init__(self, cfg: EnvConfig):
         self.cfg = cfg
@@ -156,8 +176,8 @@ class US2DPriorEnv:
             cy = random.uniform(-half + 1.0, half - 1.0)
             self.circles.append(CircleObstacle(cx, cy, r))
 
-        # Rasterize to true grid
-        self.true_grid.fill(0)  # start as free
+        # Rasterize to true grid (start as free)
+        self.true_grid.fill(0)
         for r in range(self.H):
             for c in range(self.W):
                 x, y = grid_to_world(r, c, self.H, self.W, self.cfg.map_res)
@@ -166,47 +186,111 @@ class US2DPriorEnv:
                         self.true_grid[r, c] = 1
                         break
 
+        # (NEW) Add boundary walls (1-cell thick)
+        if self.cfg.with_boundary:
+            self.true_grid[0, :]  = 1
+            self.true_grid[-1, :] = 1
+            self.true_grid[:, 0]  = 1
+            self.true_grid[:, -1] = 1
+
     def _random_pose(self):
-        # sample a free cell
+        # sample a free cell, try to avoid immediate boundary adjacency
         candidates = np.argwhere(self.true_grid == 0)
         if candidates.size == 0:
-            # fallback: set to center free
             self.pose[:] = 0.0
             return
-        idx = np.random.randint(0, len(candidates))
-        r, c = candidates[idx]
+
+        # Prefer cells away from boundary by 1 cell margin
+        for _ in range(200):
+            idx = np.random.randint(0, len(candidates))
+            r, c = candidates[idx]
+            if r <= 1 or r >= self.H - 2 or c <= 1 or c >= self.W - 2:
+                continue
+            x, y = grid_to_world(r, c, self.H, self.W, self.cfg.map_res)
+            yaw = np.random.uniform(-math.pi, math.pi)
+            self.pose[:] = (x, y, yaw)
+            return
+
+        # Fallback if margin not found
+        r, c = candidates[np.random.randint(0, len(candidates))]
         x, y = grid_to_world(r, c, self.H, self.W, self.cfg.map_res)
         yaw = np.random.uniform(-math.pi, math.pi)
         self.pose[:] = (x, y, yaw)
 
     def _build_prior(self):
+        """Build prior map into obs_grid & prior_mask.
+           - global: 按 prior_known_ratio 在全图随机揭示
+           - local_disk: 以机器人为圆心、半径 prior_local_radius_m 的圆盘内揭示
+        """
         self.obs_grid.fill(-1)
         self.prior_mask[:] = False
-        # Reveal a random subset of cells according to prior_known_ratio
-        total = self.H * self.W
-        n_prior = int(self.cfg.prior_known_ratio * total)
-        idxs = np.random.choice(total, size=n_prior, replace=False)
-        r_idx = idxs // self.W
-        c_idx = idxs % self.W
-        self.prior_mask[r_idx, c_idx] = True
 
-        # Copy truth to obs_grid for prior cells, with small flip noise
-        for r, c in zip(r_idx, c_idx):
-            val = self.true_grid[r, c]
-            if np.random.rand() < self.cfg.prior_noise_flip_prob:
-                # flip: free<->occ for robustness
-                if val == 0:
-                    val = 1
-                elif val == 1:
-                    val = 0
-            self.obs_grid[r, c] = val
+        flip_p = float(self.cfg.prior_noise_flip_prob)
+
+        if self.cfg.prior_mode == "local_disk":
+            # --- 局部先验：以当前 self.pose 为中心 ---
+            px, py = float(self.pose[0]), float(self.pose[1])
+            rad = float(self.cfg.prior_local_radius_m)
+            # 先收集圆盘内所有格子
+            idxs = []
+            for r in range(self.H):
+                # 粗裁剪：y 距离超过半径就跳过
+                y = grid_to_world(r, 0, self.H, self.W, self.cfg.map_res)[1]
+                if abs(y - py) > rad:
+                    continue
+                for c in range(self.W):
+                    x = grid_to_world(0, c, self.H, self.W, self.cfg.map_res)[0]
+                    if (x - px) ** 2 + (y - py) ** 2 <= rad ** 2:
+                        idxs.append((r, c))
+
+            if len(idxs) > 0:
+                # 在圆盘内按比例抽样（prior_local_ratio），1.0 表示圆盘内全揭示
+                take = int(round(self.cfg.prior_known_ratio * len(idxs)))
+                if take < len(idxs):
+                    idxs = random.sample(idxs, take)
+
+                # 标记 prior_mask 并写入 obs_grid（带翻转噪声）
+                for (r, c) in idxs:
+                    self.prior_mask[r, c] = True
+                    val = int(self.true_grid[r, c])
+                    if random.random() < flip_p:
+                        if val == 0: val = 1
+                        elif val == 1: val = 0
+                    self.obs_grid[r, c] = val
+
+            # 注意：此模式下不再使用 prior_known_ratio（全图比例），
+            # 如需两者并存，可在此处再额外补充少量全局 prior。
+
+        else:
+            # --- 旧逻辑：全图随机 prior ---
+            total = self.H * self.W
+            n_prior = int(self.cfg.prior_known_ratio * total)
+            idxs_flat = np.random.choice(total, size=n_prior, replace=False)
+            r_idx = idxs_flat // self.W
+            c_idx = idxs_flat % self.W
+            self.prior_mask[r_idx, c_idx] = True
+
+            for r, c in zip(r_idx, c_idx):
+                val = int(self.true_grid[r, c])
+                if np.random.rand() < flip_p:
+                    if val == 0: val = 1
+                    elif val == 1: val = 0
+                self.obs_grid[r, c] = val
+
 
     # ---------- API ----------
 
     def reset(self) -> np.ndarray:
         self._random_world()
-        self._build_prior()
-        self._random_pose()
+
+        if self.cfg.prior_mode == "local_disk":
+            # 需要先有机器人位姿，才能围绕它生成先验
+            self._random_pose()
+            self._build_prior()  # 将看到 robot-centered 局部先验
+        else:
+            # 旧逻辑：全局先验对位姿无依赖
+            self._build_prior()
+            self._random_pose()
 
         self.t_now = 0.0
         self.last_fire_t[:] = -1e9
@@ -217,6 +301,7 @@ class US2DPriorEnv:
         self.step_count = 0
 
         return self._get_obs()
+
 
     def coverage(self) -> float:
         known = (self.obs_grid != -1).sum()
@@ -231,7 +316,7 @@ class US2DPriorEnv:
             dt = max(0.0, self.t_now - float(self.last_fire_t[i]))
             dt_n = min(dt / tnorm, 1.0)
             d_n = min(self.last_dist[i] / self.cfg.max_range, 1.0)
-            v = self.last_valid[i]
+            v = float(self.last_valid[i])
             per.extend([dt_n, d_n, v])
         per = np.array(per, dtype=np.float32)
 
@@ -285,23 +370,20 @@ class US2DPriorEnv:
         touched = 0
         max_dist = 0.0
 
-        # For each sub-ray
         for theta in np.linspace(yaw_world - fov / 2.0, yaw_world + fov / 2.0, K):
-            first_hit = False
             last_cell = None
-            for (r, c) in raycast_grid(self.pose[0], self.pose[1], theta, self.cfg.max_range, self.H, self.W, self.cfg.map_res):
+            for (r, c) in raycast_grid(self.pose[0], self.pose[1], theta,
+                                       self.cfg.max_range, self.H, self.W, self.cfg.map_res):
                 touched += 1
                 last_cell = (r, c)
 
-                # If we hit an occupied cell in true map: mark it
+                # If we hit an occupied cell in true map: mark it and stop this sub-ray
                 if self.true_grid[r, c] == 1:
-                    # occupied
                     if self.obs_grid[r, c] == -1:
                         info_new += 1
                         self.obs_grid[r, c] = 1
                     else:
                         overlap += 1
-                    first_hit = True
                     break
                 else:
                     # free along the way
@@ -313,7 +395,6 @@ class US2DPriorEnv:
 
             # If no hit and we reached max range: last_cell may be the furthest
             if last_cell is not None:
-                # compute distance from robot to last_cell center
                 lx, ly = grid_to_world(last_cell[0], last_cell[1], self.H, self.W, self.cfg.map_res)
                 dx, dy = lx - self.pose[0], ly - self.pose[1]
                 dist = math.hypot(dx, dy)
@@ -326,6 +407,51 @@ class US2DPriorEnv:
         overlap_ratio = overlap / touched
         return info_gain, overlap_ratio, max_dist
 
+    # ---------- (NEW) Motion ----------
+
+    def _propagate_pose(self, dt: float):
+        """Propagate robot pose over dt using a simple unicycle model with noise.
+           x += v*cos(yaw)*h, y += v*sin(yaw)*h, yaw += w*h
+           Uses sub-steps to avoid tunneling; checks boundary/collision on true_grid.
+        """
+        if not self.cfg.motion_enabled or dt <= 0.0:
+            return
+
+        # Sample velocities (once per step is sufficient and stable)
+        v = max(0.0, float(np.random.normal(self.cfg.v_lin_mean, self.cfg.v_lin_std)))
+        w = float(np.random.normal(self.cfg.v_ang_mean, self.cfg.v_ang_std))
+
+        n = max(1, int(self.cfg.motion_substeps))
+        h = dt / n
+
+        for _ in range(n):
+            x, y, yaw = float(self.pose[0]), float(self.pose[1]), float(self.pose[2])
+            nx = x + v * math.cos(yaw) * h
+            ny = y + v * math.sin(yaw) * h
+            nyaw = (yaw + w * h + math.pi) % (2 * math.pi) - math.pi
+
+            r, c = world_to_grid(nx, ny, self.H, self.W, self.cfg.map_res)
+            out = not in_bounds(r, c, self.H, self.W)
+
+            collide = False
+            if not out:
+                # true_grid: 1=occupied/wall, 0=free
+                collide = (self.true_grid[r, c] == 1)
+
+            if (out or collide) and self.cfg.keep_inside:
+                if self.cfg.collide_stop:
+                    break  # stop remaining motion this step
+                else:
+                    # Alternative: only update yaw, keep position (glance off)
+                    self.pose[2] = nyaw
+                    continue
+            else:
+                self.pose[0] = nx
+                self.pose[1] = ny
+                self.pose[2] = nyaw
+
+    # ---------- Step ----------
+
     def step(self, a: int):
         mask = self.action_mask()
         assert mask[a] == 1, "Illegal action selected. Ensure the policy respects the mask."
@@ -336,7 +462,7 @@ class US2DPriorEnv:
         # Simulate measurement over cone FoV
         info_gain, overlap, max_dist = self._cast_cone_and_update(yaw_world)
 
-        # Random dropout fail
+        # Random dropout fail (note: current design updates map regardless of fail)
         valid = 1.0
         if random.random() < self.cfg.dropout_prob:
             valid = 0.0
@@ -353,6 +479,9 @@ class US2DPriorEnv:
         self.last_conf[a] = valid
         self.last_action = a
         self.step_count += 1
+
+        # (NEW) Propagate pose during the ping time window
+        self._propagate_pose(dt)
 
         # Termination
         done = False
@@ -411,5 +540,3 @@ class VecEnvs:
 
     def coverage(self) -> float:
         return float(np.mean([e.coverage() for e in self.envs]))
-#test
-#一个一个我操死你的🐎
