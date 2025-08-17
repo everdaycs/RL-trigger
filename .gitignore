@@ -4,4 +4,14 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
-*.pkl  
+*.pkl
+
+# Visualization outputs
+visualizations/
+out_vis/
+# image outputs
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf

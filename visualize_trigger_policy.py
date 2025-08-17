@@ -1,4 +1,3 @@
-
 # visualize_trigger_policy.py
 # -------------------------------------------------------------
 # Visualize PPO policy (or a masked-random baseline) on the
@@ -20,6 +19,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
+import os
+from datetime import datetime
 
 from env_us2d_prior import EnvConfig, VecEnvs, US2DPriorEnv
 
@@ -109,78 +110,102 @@ def run_episode(env: US2DPriorEnv, actor: Actor = None, device='cpu', max_steps=
 def plot_curves(results):
     steps = np.arange(1, results["steps"] + 1)
 
+    figs = {}
+
     # 1) Coverage vs steps
-    plt.figure()
-    plt.plot(steps, results["coverage"])
-    plt.xlabel("Step")
-    plt.ylabel("Coverage")
-    plt.title("Coverage vs Steps")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(steps, results["coverage"])
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Coverage")
+    ax.set_title("Coverage vs Steps")
+    fig.tight_layout()
+    figs["coverage"] = fig
 
     # 2) Cumulative time vs steps
-    plt.figure()
-    plt.plot(steps, results["cum_time"])
-    plt.xlabel("Step")
-    plt.ylabel("Cumulative Time (s)")
-    plt.title("Cumulative Time vs Steps")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(steps, results["cum_time"])
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Cumulative Time (s)")
+    ax.set_title("Cumulative Time vs Steps")
+    fig.tight_layout()
+    figs["cum_time"] = fig
 
     # 3) Info gain per step
-    plt.figure()
-    plt.plot(steps, results["info_gain"])
-    plt.xlabel("Step")
-    plt.ylabel("Info Gain (fraction new cells)")
-    plt.title("Info Gain per Step")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(steps, results["info_gain"])
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Info Gain (fraction new cells)")
+    ax.set_title("Info Gain per Step")
+    fig.tight_layout()
+    figs["info_gain"] = fig
 
     # 4) Overlap per step
-    plt.figure()
-    plt.plot(steps, results["overlap"])
-    plt.xlabel("Step")
-    plt.ylabel("Overlap (fraction known cells)")
-    plt.title("Overlap per Step")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(steps, results["overlap"])
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Overlap (fraction known cells)")
+    ax.set_title("Overlap per Step")
+    fig.tight_layout()
+    figs["overlap"] = fig
 
     # 5) Fail per step
-    plt.figure()
-    plt.plot(steps, results["fail"])
-    plt.xlabel("Step")
-    plt.ylabel("Fail (0 or 1)")
-    plt.title("Fail per Step")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.plot(steps, results["fail"])
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Fail (0 or 1)")
+    ax.set_title("Fail per Step")
+    fig.tight_layout()
+    figs["fail"] = fig
+
+    return figs
 
 def plot_maps(results, cfg: EnvConfig):
     H, W = results["true_grid"].shape
+    figs = {}
 
     # 6a) True occupancy
-    plt.figure()
-    plt.imshow(results["true_grid"], origin="lower", interpolation="nearest")
-    plt.title("True Occupancy (1=occ, 0=free)")
-    plt.xlabel("X (cols)")
-    plt.ylabel("Y (rows)")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.imshow(results["true_grid"], origin="lower", interpolation="nearest")
+    ax.set_title("True Occupancy (1=occ, 0=free)")
+    ax.set_xlabel("X (cols)")
+    ax.set_ylabel("Y (rows)")
+    fig.tight_layout()
+    figs["true_grid"] = fig
 
     # 6b) Prior observed map
-    plt.figure()
-    plt.imshow(results["prior_obs_grid"], origin="lower", interpolation="nearest")
-    plt.title("Prior Observed Map (-1 unknown, 0 free, 1 occ)")
-    plt.xlabel("X (cols)")
-    plt.ylabel("Y (rows)")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.imshow(results["prior_obs_grid"], origin="lower", interpolation="nearest")
+    ax.set_title("Prior Observed Map (-1 unknown, 0 free, 1 occ)")
+    ax.set_xlabel("X (cols)")
+    ax.set_ylabel("Y (rows)")
+    fig.tight_layout()
+    figs["prior_obs_grid"] = fig
 
     # 6c) Final observed map
-    plt.figure()
-    plt.imshow(results["final_obs_grid"], origin="lower", interpolation="nearest")
-    plt.title("Final Observed Map (-1 unknown, 0 free, 1 occ)")
-    plt.xlabel("X (cols)")
-    plt.ylabel("Y (rows)")
-    plt.tight_layout()
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.imshow(results["final_obs_grid"], origin="lower", interpolation="nearest")
+    ax.set_title("Final Observed Map (-1 unknown, 0 free, 1 occ)")
+    ax.set_xlabel("X (cols)")
+    ax.set_ylabel("Y (rows)")
+    fig.tight_layout()
+    figs["final_obs_grid"] = fig
+
+    return figs
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default="", help="Path to trained model (ppo_trigger.pt). If empty, use masked-random baseline.")
     parser.add_argument("--seed", type=int, default=123, help="Random seed")
     parser.add_argument("--steps", type=int, default=400, help="Max episode steps")
+    parser.add_argument("--outdir", type=str, default="visualizations", help="Directory to save visualizations and CSV")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
@@ -205,11 +230,15 @@ def main():
 
     results = run_episode(env, actor=actor, device="cpu", max_steps=args.steps)
 
-    # Plot curves and maps
-    plot_curves(results)
-    plot_maps(results, env_cfg)
+    # Plot curves and maps (get Figure objects)
+    curve_figs = plot_curves(results)
+    map_figs = plot_maps(results, env_cfg)
 
-    # Optionally save a CSV summary
+    # Create output directory with timestamp
+    os.makedirs(args.outdir, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+
+    # Save CSV summary with timestamp
     csv = np.stack([
         np.arange(1, results["steps"] + 1),
         results["coverage"],
@@ -219,12 +248,20 @@ def main():
         results["fail"],
         results["dt"],
     ], axis=1)
-    np.savetxt("episode_summary.csv",
-               csv,
-               delimiter=",",
+    csv_path = os.path.join(args.outdir, f"episode_summary_{stamp}.csv")
+    np.savetxt(csv_path, csv, delimiter=",",
                header="step,coverage,cum_time,info_gain,overlap,fail,dt",
                comments="")
-    print("Saved per-step summary to episode_summary.csv")
+    print(f"Saved per-step summary to {csv_path}")
+
+    # Save figures
+    all_figs = {}
+    all_figs.update(curve_figs)
+    all_figs.update(map_figs)
+    for name, fig in all_figs.items():
+        fname = os.path.join(args.outdir, f"{name}_{stamp}.png")
+        fig.savefig(fname)
+        print(f"Saved figure {fname}")
 
     plt.show()
 
