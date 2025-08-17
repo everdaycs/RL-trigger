@@ -411,3 +411,4 @@ class VecEnvs:
 
     def coverage(self) -> float:
         return float(np.mean([e.coverage() for e in self.envs]))
+#test
