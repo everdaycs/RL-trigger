@@ -51,7 +51,7 @@ class EnvConfig:
     map_res: float = 0.1                    # [m] cell resolution
     prior_known_ratio: float = 0.2        # fraction of cells to reveal as prior
     prior_noise_flip_prob: float = 0.01     # small fraction of prior cells flipped to simulate errors
-    episode_max_steps: int = 256
+    episode_max_steps: int = 128
     coverage_stop: float = 0.2
 
     # FoV rasterization
@@ -62,7 +62,7 @@ class EnvConfig:
 
     # (NEW) Robot motion during ping time window dt (simple unicycle)
     motion_enabled: bool = True             # enable pose propagation over dt
-    v_lin_mean: float = 0.20                # mean linear velocity [m/s]
+    v_lin_mean: float = 0.30                # mean linear velocity [m/s]
     v_lin_std:  float = 0.05                # std  linear velocity [m/s]
     v_ang_mean: float = 0.0                 # mean angular velocity [rad/s]
     v_ang_std:  float = 0.20                # std  angular velocity [rad/s]

@@ -26,13 +26,13 @@ class TrainConfig:
     w_info: float = 1.0
     w_fail: float = 3.0
     w_time: float = 0.05
-    w_overlap: float = 0.2
+    w_overlap: float = 2
 
     # PPO / training
     device: str = "cpu"         # "cuda" if available
-    total_updates: int = 500
-    n_envs: int = 32
-    rollout_steps: int = 32
+    total_updates: int = 1500
+    n_envs: int = 64
+    rollout_steps: int = 64
     gamma: float = 0.99
     gae_lambda: float = 0.95
     ppo_epochs: int = 4
