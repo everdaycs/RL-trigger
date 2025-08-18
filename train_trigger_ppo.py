@@ -30,8 +30,8 @@ class TrainConfig:
     # PPO / training
     device: str = "cpu"         # "cuda" if available
     total_updates: int = 500
-    n_envs: int = 64
-    rollout_steps: int = 128
+    n_envs: int = 32
+    rollout_steps: int = 32
     gamma: float = 0.99
     gae_lambda: float = 0.95
     ppo_epochs: int = 4

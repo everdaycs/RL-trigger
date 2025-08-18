@@ -22,7 +22,7 @@ import matplotlib.pyplot as plt
 import os
 from datetime import datetime
 
-from env_us2d_prior import EnvConfig, VecEnvs, US2DPriorEnv
+from env_us2d_prior import EnvConfig, VecEnvs, US2DPriorEnv, world_to_grid
 
 # --- PPO actor (same arch as training) ---
 
@@ -66,6 +66,9 @@ def run_episode(env: US2DPriorEnv, actor: Actor = None, device='cpu', max_steps=
     prior_obs_grid = env.obs_grid.copy()
     true_grid = env.true_grid.copy()
 
+    # pose history (world coords) for trajectory plotting; include initial pose
+    pose_hist = [env.pose.copy()]
+
     for t in range(max_steps):
         mask_np = env.action_mask().astype(np.float32)
         obs_t = torch.tensor(obs[None, :], dtype=torch.float32, device=device)
@@ -81,6 +84,9 @@ def run_episode(env: US2DPriorEnv, actor: Actor = None, device='cpu', max_steps=
                 a = masked_sample(logits, mask_t)[0]
 
         obs, r_raw, done, info = env.step(int(a))
+
+        # record pose after step
+        pose_hist.append(env.pose.copy())
 
         cov_hist.append(info["coverage"])
         time_hist.append(env.t_now)
@@ -104,7 +110,8 @@ def run_episode(env: US2DPriorEnv, actor: Actor = None, device='cpu', max_steps=
         "prior_obs_grid": prior_obs_grid,
         "final_obs_grid": final_obs_grid,
         "steps": len(cov_hist),
-        "pose": env.pose.copy(),
+    "pose": env.pose.copy(),
+    "pose_hist": np.stack(pose_hist, axis=0),
     }
 
 def plot_curves(results):
@@ -195,6 +202,16 @@ def plot_maps(results, cfg: EnvConfig):
     ax.set_title("Final Observed Map (-1 unknown, 0 free, 1 occ)")
     ax.set_xlabel("X (cols)")
     ax.set_ylabel("Y (rows)")
+    # overlay trajectory if present
+    if "pose_hist" in results:
+        poses = results["pose_hist"]
+        coords = [world_to_grid(p[0], p[1], H, W, cfg.map_res) for p in poses]
+        rs = [c[0] for c in coords]
+        cs = [c[1] for c in coords]
+        ax.plot(cs, rs, color="cyan", linewidth=1.5, marker=None)
+        ax.plot(cs[0], rs[0], marker="o", color="green", markersize=6, label="start")
+        ax.plot(cs[-1], rs[-1], marker="x", color="red", markersize=6, label="end")
+        ax.legend()
     fig.tight_layout()
     figs["final_obs_grid"] = fig
 
@@ -234,9 +251,10 @@ def main():
     curve_figs = plot_curves(results)
     map_figs = plot_maps(results, env_cfg)
 
-    # Create output directory with timestamp
-    os.makedirs(args.outdir, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # Create output directory with timestamped subdirectory (YYYY-MM-DD_HH-MM-SS)
+    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    outdir_full = os.path.join(args.outdir, stamp)
+    os.makedirs(outdir_full, exist_ok=True)
 
     # Save CSV summary with timestamp
     csv = np.stack([
@@ -248,18 +266,18 @@ def main():
         results["fail"],
         results["dt"],
     ], axis=1)
-    csv_path = os.path.join(args.outdir, f"episode_summary_{stamp}.csv")
+    csv_path = os.path.join(outdir_full, f"episode_summary_{stamp}.csv")
     np.savetxt(csv_path, csv, delimiter=",",
                header="step,coverage,cum_time,info_gain,overlap,fail,dt",
                comments="")
     print(f"Saved per-step summary to {csv_path}")
 
-    # Save figures
+    # Save figures into timestamped subdirectory
     all_figs = {}
     all_figs.update(curve_figs)
     all_figs.update(map_figs)
     for name, fig in all_figs.items():
-        fname = os.path.join(args.outdir, f"{name}_{stamp}.png")
+        fname = os.path.join(outdir_full, f"{name}_{stamp}.png")
         fig.savefig(fname)
         print(f"Saved figure {fname}")
 

@@ -48,8 +48,8 @@ class EnvConfig:
     map_res: float = 0.1                    # [m] cell resolution
     prior_known_ratio: float = 0.2        # fraction of cells to reveal as prior
     prior_noise_flip_prob: float = 0.01     # small fraction of prior cells flipped to simulate errors
-    episode_max_steps: int = 129
-    coverage_stop: float = 0.9
+    episode_max_steps: int = 256
+    coverage_stop: float = 0.2
 
     # FoV rasterization
     subrays_per_fov: int = 9                # number of sub-rays across FoV cone
@@ -59,7 +59,7 @@ class EnvConfig:
 
     # (NEW) Robot motion during ping time window dt (simple unicycle)
     motion_enabled: bool = True             # enable pose propagation over dt
-    v_lin_mean: float = 0.10                # mean linear velocity [m/s]
+    v_lin_mean: float = 0.20                # mean linear velocity [m/s]
     v_lin_std:  float = 0.05                # std  linear velocity [m/s]
     v_ang_mean: float = 0.0                 # mean angular velocity [rad/s]
     v_ang_std:  float = 0.20                # std  angular velocity [rad/s]
@@ -357,11 +357,11 @@ class US2DPriorEnv:
 
     # ---------- Sensing ----------
 
-    def _cast_cone_and_update(self, yaw_world: float) -> Tuple[float, float, float]:
+    def _cast_cone_and_update(self, yaw_world: float) -> Tuple[float, float, float, float]:
         """
         Cast multiple sub-rays in [yaw - fov/2, yaw + fov/2].
         Update obs_grid along each ray using true_grid to determine hit.
-        Returns (info_gain, overlap, max_dist_touched).
+        Returns (info_gain, overlap, max_dist_touched, min_dist_closest_hit).
         """
         fov = math.radians(self.cfg.sensor_fov_deg)
         K = max(1, int(self.cfg.subrays_per_fov))
@@ -369,15 +369,72 @@ class US2DPriorEnv:
         overlap = 0
         touched = 0
         max_dist = 0.0
+        min_dist = float('inf')
 
         for theta in np.linspace(yaw_world - fov / 2.0, yaw_world + fov / 2.0, K):
+            # collect cells visited by this subray and optional hit
             last_cell = None
+            cells_this = []
+            hit_this = None
             for (r, c) in raycast_grid(self.pose[0], self.pose[1], theta,
                                        self.cfg.max_range, self.H, self.W, self.cfg.map_res):
-                touched += 1
+                cells_this.append((r, c))
                 last_cell = (r, c)
+                # stop on occupied
+                if self.true_grid[r, c] == 1:
+                    hit_this = (r, c)
+                    break
 
-                # If we hit an occupied cell in true map: mark it and stop this sub-ray
+            # store subray data
+            # compute furthest distance touched by this subray (last_cell)
+            if last_cell is not None:
+                lx, ly = grid_to_world(last_cell[0], last_cell[1], self.H, self.W, self.cfg.map_res)
+                dx, dy = lx - self.pose[0], ly - self.pose[1]
+                dist = math.hypot(dx, dy)
+                if dist > max_dist:
+                    max_dist = dist
+            else:
+                dist = 0.0
+
+            # if hit, consider for min_dist
+            if hit_this is not None:
+                hx, hy = grid_to_world(hit_this[0], hit_this[1], self.H, self.W, self.cfg.map_res)
+                hdist = math.hypot(hx - self.pose[0], hy - self.pose[1])
+                if hdist < min_dist:
+                    min_dist = hdist
+
+            # append collected data
+            # We reuse touched/info_new/overlap later based on selection
+            # store as tuple: (cells_this, hit_this, last_cell, dist)
+            if 'subrays' not in locals():
+                subrays = []
+            subrays.append((cells_this, hit_this, last_cell, dist))
+
+        # Decide which subray(s) to use for updating the map
+        # If any subray had a hit, choose the one with the closest hit (min_dist)
+        info_new = 0
+        overlap = 0
+        touched = 0
+        if min_dist != float('inf') and min_dist > 0.0:
+            # find subray index with hit at distance == min_dist (closest)
+            chosen = None
+            for idx, (cells_this, hit_this, last_cell, dist) in enumerate(subrays):
+                if hit_this is not None:
+                    hx, hy = grid_to_world(hit_this[0], hit_this[1], self.H, self.W, self.cfg.map_res)
+                    hdist = math.hypot(hx - self.pose[0], hy - self.pose[1])
+                    if abs(hdist - min_dist) < 1e-6:
+                        chosen = idx
+                        break
+            # fallback: choose first hit subray
+            if chosen is None:
+                for idx, (cells_this, hit_this, last_cell, dist) in enumerate(subrays):
+                    if hit_this is not None:
+                        chosen = idx
+                        break
+
+            cells_this, hit_this, last_cell, dist = subrays[chosen]
+            touched = len(cells_this)
+            for (r, c) in cells_this:
                 if self.true_grid[r, c] == 1:
                     if self.obs_grid[r, c] == -1:
                         info_new += 1
@@ -386,26 +443,30 @@ class US2DPriorEnv:
                         overlap += 1
                     break
                 else:
-                    # free along the way
                     if self.obs_grid[r, c] == -1:
                         info_new += 1
                         self.obs_grid[r, c] = 0
                     else:
                         overlap += 1
-
-            # If no hit and we reached max range: last_cell may be the furthest
-            if last_cell is not None:
-                lx, ly = grid_to_world(last_cell[0], last_cell[1], self.H, self.W, self.cfg.map_res)
-                dx, dy = lx - self.pose[0], ly - self.pose[1]
-                dist = math.hypot(dx, dy)
-                if dist > max_dist:
-                    max_dist = dist
+        else:
+            # no occupied hits in any subray: keep original behavior and update all subrays
+            for (cells_this, hit_this, last_cell, dist) in subrays:
+                touched += len(cells_this)
+                for (r, c) in cells_this:
+                    if self.obs_grid[r, c] == -1:
+                        info_new += 1
+                        self.obs_grid[r, c] = int(self.true_grid[r, c])
+                    else:
+                        overlap += 1
 
         if touched == 0:
-            return 0.0, 0.0, 0.0
-        info_gain = info_new / touched
-        overlap_ratio = overlap / touched
-        return info_gain, overlap_ratio, max_dist
+            return 0.0, 0.0, 0.0, 0.0
+        info_gain = info_new / float(touched)
+        overlap_ratio = overlap / float(touched)
+        # if no occupied cell was seen in any subray, min_dist will remain inf
+        if min_dist == float('inf'):
+            min_dist = 0.0
+        return info_gain, overlap_ratio, max_dist, min_dist
 
     # ---------- (NEW) Motion ----------
 
@@ -460,7 +521,7 @@ class US2DPriorEnv:
         yaw_world = self.pose[2] + self.sensor_dirs[a]
 
         # Simulate measurement over cone FoV
-        info_gain, overlap, max_dist = self._cast_cone_and_update(yaw_world)
+        info_gain, overlap, max_dist, min_dist = self._cast_cone_and_update(yaw_world)
 
         # Random dropout fail (note: current design updates map regardless of fail)
         valid = 1.0
@@ -468,7 +529,9 @@ class US2DPriorEnv:
             valid = 0.0
 
         # Time cost: round-trip
-        dist_for_time = max_dist if max_dist > 0 else self.cfg.max_range
+        # Use the shortest hit distance among subrays as the sensor's reported distance
+        # If no hit (min_dist == 0.0), fall back to max_range
+        dist_for_time = min_dist if min_dist > 0 else self.cfg.max_range
         dt = self.cfg.base_overhead_s + (2.0 * dist_for_time / self.cfg.speed_of_sound) + 0.001
         self.t_now += dt
         self.last_fire_t[a] = self.t_now
