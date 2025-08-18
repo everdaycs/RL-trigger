@@ -23,22 +23,11 @@ import os
 from datetime import datetime
 
 from env_us2d_prior import EnvConfig, VecEnvs, US2DPriorEnv, world_to_grid
+from models.networks import Actor
 
 # --- PPO actor (same arch as training) ---
 
-class Actor(nn.Module):
-    def __init__(self, obs_dim: int, n_actions: int):
-        super().__init__()
-        hid = 256
-        self.body = nn.Sequential(
-            nn.Linear(obs_dim, hid), nn.Tanh(),
-            nn.Linear(hid, hid), nn.Tanh(),
-        )
-        self.pi = nn.Linear(hid, n_actions)
-
-    def forward(self, obs: torch.Tensor):
-        x = self.body(obs)
-        return self.pi(x)
+# Actor moved to models.networks.Actor
 
 def masked_sample(logits: torch.Tensor, mask: torch.Tensor) -> np.ndarray:
     # mask: 1 valid, 0 invalid

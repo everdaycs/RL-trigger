@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from typing import Tuple, Dict, Any, List
 
 import numpy as np
+from envs import utils as env_utils
+from envs import sensor as env_sensor
+from envs import robot as env_robot
 
 # =========================
 # ======  CONFIG  =========
@@ -34,7 +37,7 @@ class EnvConfig:
     max_range: float = 8.0                  # [m]
     speed_of_sound: float = 343.0           # [m/s]
     base_overhead_s: float = 0.003          # [s]
-    dropout_prob: float = 0.03              # random dropout
+    dropout_prob: float = 0.001              # random dropout
     theta_min_deg: float = 20.0             # hard angular separation
     dt_min_s: float = 0.02                  # hard time separation
 
@@ -70,6 +73,8 @@ class EnvConfig:
     # ---- Prior options (NEW) ----
     prior_mode: str = "local_disk"        # "global" | "local_disk"
     prior_local_radius_m: float = 3.0 # 局部先验半径（以机器人为圆心）
+    # Time penalty multiplier applied when an action is masked (interference)
+    masked_time_multiplier: float = 3.0
 
 # =========================
 # ======  UTILITIES  ======
@@ -80,35 +85,17 @@ def logit(p: float) -> float:
     return math.log(p / (1 - p))
 
 def world_to_grid(x: float, y: float, H: int, W: int, res: float) -> Tuple[int, int]:
-    # Map frame: (0,0) at bottom-left, x right, y up.
-    # World frame: centered at (0,0). Convert world -> map indices.
-    half = (W * res) / 2.0
-    gx = int((x + half) / res)
-    gy = int((y + half) / res)
-    return gy, gx  # (row, col)
+    return env_utils.world_to_grid(x, y, H, W, res)
 
 def grid_to_world(r: int, c: int, H: int, W: int, res: float) -> Tuple[float, float]:
-    half = (W * res) / 2.0
-    x = (c + 0.5) * res - half
-    y = (r + 0.5) * res - half
-    return x, y
+    return env_utils.grid_to_world(r, c, H, W, res)
 
 def in_bounds(r: int, c: int, H: int, W: int) -> bool:
-    return (0 <= r < H) and (0 <= c < W)
+    return env_utils.in_bounds(r, c, H, W)
 
 # Bresenham-like ray traversal on grid
 def raycast_grid(x0: float, y0: float, theta: float, max_range: float, H: int, W: int, res: float):
-    """Yield grid indices (r,c) along a ray from (x0,y0) until max_range."""
-    step = res * 0.5  # robust small steps
-    dx, dy = math.cos(theta) * step, math.sin(theta) * step
-    n_steps = int(max_range / step) + 1
-    x, y = x0, y0
-    for _ in range(n_steps):
-        r, c = world_to_grid(x, y, H, W, res)
-        if not in_bounds(r, c, H, W):
-            break
-        yield (r, c)
-        x += dx; y += dy
+    return env_utils.raycast_grid(x0, y0, theta, max_range, H, W, res)
 
 # =========================
 # ======  ENV SIM  ========
@@ -358,114 +345,9 @@ class US2DPriorEnv:
     # ---------- Sensing ----------
 
     def _cast_cone_and_update(self, yaw_world: float) -> Tuple[float, float, float, float]:
-        """
-        Cast multiple sub-rays in [yaw - fov/2, yaw + fov/2].
-        Update obs_grid along each ray using true_grid to determine hit.
-        Returns (info_gain, overlap, max_dist_touched, min_dist_closest_hit).
-        """
-        fov = math.radians(self.cfg.sensor_fov_deg)
-        K = max(1, int(self.cfg.subrays_per_fov))
-        info_new = 0
-        overlap = 0
-        touched = 0
-        max_dist = 0.0
-        min_dist = float('inf')
-
-        for theta in np.linspace(yaw_world - fov / 2.0, yaw_world + fov / 2.0, K):
-            # collect cells visited by this subray and optional hit
-            last_cell = None
-            cells_this = []
-            hit_this = None
-            for (r, c) in raycast_grid(self.pose[0], self.pose[1], theta,
-                                       self.cfg.max_range, self.H, self.W, self.cfg.map_res):
-                cells_this.append((r, c))
-                last_cell = (r, c)
-                # stop on occupied
-                if self.true_grid[r, c] == 1:
-                    hit_this = (r, c)
-                    break
-
-            # store subray data
-            # compute furthest distance touched by this subray (last_cell)
-            if last_cell is not None:
-                lx, ly = grid_to_world(last_cell[0], last_cell[1], self.H, self.W, self.cfg.map_res)
-                dx, dy = lx - self.pose[0], ly - self.pose[1]
-                dist = math.hypot(dx, dy)
-                if dist > max_dist:
-                    max_dist = dist
-            else:
-                dist = 0.0
-
-            # if hit, consider for min_dist
-            if hit_this is not None:
-                hx, hy = grid_to_world(hit_this[0], hit_this[1], self.H, self.W, self.cfg.map_res)
-                hdist = math.hypot(hx - self.pose[0], hy - self.pose[1])
-                if hdist < min_dist:
-                    min_dist = hdist
-
-            # append collected data
-            # We reuse touched/info_new/overlap later based on selection
-            # store as tuple: (cells_this, hit_this, last_cell, dist)
-            if 'subrays' not in locals():
-                subrays = []
-            subrays.append((cells_this, hit_this, last_cell, dist))
-
-        # Decide which subray(s) to use for updating the map
-        # If any subray had a hit, choose the one with the closest hit (min_dist)
-        info_new = 0
-        overlap = 0
-        touched = 0
-        if min_dist != float('inf') and min_dist > 0.0:
-            # find subray index with hit at distance == min_dist (closest)
-            chosen = None
-            for idx, (cells_this, hit_this, last_cell, dist) in enumerate(subrays):
-                if hit_this is not None:
-                    hx, hy = grid_to_world(hit_this[0], hit_this[1], self.H, self.W, self.cfg.map_res)
-                    hdist = math.hypot(hx - self.pose[0], hy - self.pose[1])
-                    if abs(hdist - min_dist) < 1e-6:
-                        chosen = idx
-                        break
-            # fallback: choose first hit subray
-            if chosen is None:
-                for idx, (cells_this, hit_this, last_cell, dist) in enumerate(subrays):
-                    if hit_this is not None:
-                        chosen = idx
-                        break
-
-            cells_this, hit_this, last_cell, dist = subrays[chosen]
-            touched = len(cells_this)
-            for (r, c) in cells_this:
-                if self.true_grid[r, c] == 1:
-                    if self.obs_grid[r, c] == -1:
-                        info_new += 1
-                        self.obs_grid[r, c] = 1
-                    else:
-                        overlap += 1
-                    break
-                else:
-                    if self.obs_grid[r, c] == -1:
-                        info_new += 1
-                        self.obs_grid[r, c] = 0
-                    else:
-                        overlap += 1
-        else:
-            # no occupied hits in any subray: keep original behavior and update all subrays
-            for (cells_this, hit_this, last_cell, dist) in subrays:
-                touched += len(cells_this)
-                for (r, c) in cells_this:
-                    if self.obs_grid[r, c] == -1:
-                        info_new += 1
-                        self.obs_grid[r, c] = int(self.true_grid[r, c])
-                    else:
-                        overlap += 1
-
-        if touched == 0:
-            return 0.0, 0.0, 0.0, 0.0
-        info_gain = info_new / float(touched)
-        overlap_ratio = overlap / float(touched)
-        # if no occupied cell was seen in any subray, min_dist will remain inf
-        if min_dist == float('inf'):
-            min_dist = 0.0
+        # Delegate to sensor module which returns (info_gain, overlap, max_dist, min_dist, subrays)
+        info_gain, overlap_ratio, max_dist, min_dist, subrays = env_sensor.cast_cone(self, yaw_world, self.cfg.subrays_per_fov)
+        # sensor.cast_cone already updates self.obs_grid as appropriate
         return info_gain, overlap_ratio, max_dist, min_dist
 
     # ---------- (NEW) Motion ----------
@@ -515,7 +397,46 @@ class US2DPriorEnv:
 
     def step(self, a: int):
         mask = self.action_mask()
-        assert mask[a] == 1, "Illegal action selected. Ensure the policy respects the mask."
+
+        # If action is masked (too close in time/angle), treat it as an interference fail
+        if mask[a] == 0:
+            # No sensing update; count as fail and apply a time penalty (use max_range for time)
+            valid = 0.0
+            info_gain = 0.0
+            overlap = 0.0
+            dist_for_time = self.cfg.max_range
+            dt = self.cfg.base_overhead_s + (2.0 * dist_for_time / self.cfg.speed_of_sound) + 0.001
+            self.t_now += dt
+            self.last_fire_t[a] = self.t_now
+
+            # Update last measurement memory to indicate failure
+            self.last_dist[a] = dist_for_time
+            self.last_valid[a] = 0.0
+            self.last_conf[a] = 0.0
+            self.last_action = a
+            self.step_count += 1
+
+            # Propagate pose during the ping time window
+            self._propagate_pose(dt)
+
+            # Termination
+            done = False
+            if self.step_count >= self.cfg.episode_max_steps:
+                done = True
+            elif self.coverage() >= self.cfg.coverage_stop:
+                done = True
+
+            obs = self._get_obs()
+            info = {
+                "mask": mask,
+                "info_gain": info_gain,
+                "overlap": overlap,
+                "fail": 1.0,
+                "dt": dt,
+                "coverage": self.coverage(),
+            }
+            reward = (info_gain, overlap, 1.0, dt)
+            return obs, reward, done, info
 
         # Sensor direction in world
         yaw_world = self.pose[2] + self.sensor_dirs[a]

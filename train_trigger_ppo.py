@@ -14,6 +14,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from env_us2d_prior import EnvConfig, VecEnvs
+from models.networks import ActorCritic, MaskedCategorical
 
 # =========================
 # ======  CONFIG  =========
@@ -49,34 +50,7 @@ class TrainConfig:
 # =====  PPO AGENT  =======
 # =========================
 
-class MaskedCategorical(torch.distributions.Categorical):
-    def __init__(self, logits: torch.Tensor, mask: torch.Tensor = None):
-        if mask is not None:
-            logits = logits.masked_fill(mask == 0, -1e9)
-        super().__init__(logits=logits)
-
-class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int, n_actions: int):
-        super().__init__()
-        hid = 256
-        self.body = nn.Sequential(
-            nn.Linear(obs_dim, hid), nn.Tanh(),
-            nn.Linear(hid, hid), nn.Tanh(),
-        )
-        self.pi = nn.Linear(hid, n_actions)
-        self.v = nn.Linear(hid, 1)
-
-    def forward(self, obs: torch.Tensor):
-        x = self.body(obs)
-        return self.pi(x), self.v(x)
-
-    def act(self, obs: torch.Tensor, mask: torch.Tensor):
-        logits, v = self.forward(obs)
-        dist = MaskedCategorical(logits=logits, mask=mask)
-        a = dist.sample()
-        logp = dist.log_prob(a)
-        ent = dist.entropy()
-        return a, logp, ent, v.squeeze(-1)
+## networks moved to models/networks.py
 
 # =========================
 # ========  PPO  ==========
@@ -122,6 +96,8 @@ def train(env_cfg: EnvConfig, cfg: TrainConfig):
         done_buf = np.zeros((cfg.rollout_steps, cfg.n_envs), dtype=np.bool_)
         val_buf = np.zeros((cfg.rollout_steps + 1, cfg.n_envs), dtype=np.float32)
         ent_buf = np.zeros((cfg.rollout_steps, cfg.n_envs), dtype=np.float32)
+        # store masks used at sampling time so update phase can apply same masking
+        mask_buf = np.zeros((cfg.rollout_steps, cfg.n_envs, n_actions), dtype=np.int8)
 
         obs_np = vec.obs.copy()
         for t in range(cfg.rollout_steps):
@@ -157,6 +133,7 @@ def train(env_cfg: EnvConfig, cfg: TrainConfig):
             done_buf[t] = d_np
             val_buf[t] = v_np
             ent_buf[t] = ent_np
+            mask_buf[t] = mask_np
 
             obs_np = next_obs_np
             global_step += cfg.n_envs
@@ -177,6 +154,7 @@ def train(env_cfg: EnvConfig, cfg: TrainConfig):
         logp_b_old = torch.tensor(logp_buf.reshape(-1), dtype=torch.float32, device=dev)
         adv_b = torch.tensor(adv_np.reshape(-1), dtype=torch.float32, device=dev)
         ret_b = torch.tensor(ret_np.reshape(-1), dtype=torch.float32, device=dev)
+        mask_b = torch.tensor(mask_buf.reshape(-1, mask_buf.shape[-1]), dtype=torch.float32, device=dev)
 
         # normalize advantages
         adv_b = (adv_b - adv_b.mean()) / (adv_b.std() + 1e-8)
@@ -194,9 +172,11 @@ def train(env_cfg: EnvConfig, cfg: TrainConfig):
                 mb_logp_old = logp_b_old[mb_idx]
                 mb_adv = adv_b[mb_idx]
                 mb_ret = ret_b[mb_idx]
+                mb_mask = mask_b[mb_idx]
 
                 logits, v = net.forward(mb_obs)
-                dist = torch.distributions.Categorical(logits=logits)  # no mask in update phase
+                # apply the same mask used at sampling when building the distribution
+                dist = MaskedCategorical(logits=logits, mask=mb_mask)
                 logp = dist.log_prob(mb_act)
                 entropy = dist.entropy().mean()
 
