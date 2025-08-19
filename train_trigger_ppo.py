@@ -23,10 +23,10 @@ from models.networks import ActorCritic, MaskedCategorical
 @dataclass
 class TrainConfig:
     # reward weights
-    w_info: float = 1.0
-    w_fail: float = 3.0
-    w_time: float = 0.05
-    w_overlap: float = 2
+    w_info: float = 3.0
+    w_fail: float = 0.0
+    w_time: float = 0.0
+    w_overlap: float = 3.0
 
     # PPO / training
     device: str = "cpu"         # "cuda" if available
