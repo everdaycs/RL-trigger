@@ -12,7 +12,7 @@ class MaskedCategorical(torch.distributions.Categorical):
 class ActorCritic(nn.Module):
     def __init__(self, obs_dim: int, n_actions: int):
         super().__init__()
-        hid = 256
+        hid = 64
         self.body = nn.Sequential(
             nn.Linear(obs_dim, hid), nn.Tanh(),
             nn.Linear(hid, hid), nn.Tanh(),
@@ -36,7 +36,7 @@ class ActorCritic(nn.Module):
 class Actor(nn.Module):
     def __init__(self, obs_dim: int, n_actions: int):
         super().__init__()
-        hid = 256
+        hid = 64
         self.body = nn.Sequential(
             nn.Linear(obs_dim, hid), nn.Tanh(),
             nn.Linear(hid, hid), nn.Tanh(),
