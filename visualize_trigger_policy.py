@@ -338,9 +338,15 @@ def main():
         try:
             # Safe load: weights_only + strict=False to ignore extra heads (e.g., value head)
             state = torch.load(args.model, map_location="cpu", weights_only=True)
-            missing, unexpected = actor.load_state_dict(state, strict=False)
+            
+            # Filter out value function parameters to avoid warnings
+            actor_state = {k: v for k, v in state.items() if not k.startswith('v.')}
+            
+            missing, unexpected = actor.load_state_dict(actor_state, strict=False)
             if unexpected:
                 print(f"Warning: unexpected keys ignored: {unexpected}")
+            if missing:
+                print(f"Warning: missing keys: {missing}")
             print(f"Loaded model from {args.model}")
         except Exception as e:
             print(f"Failed to load model: {e}. Falling back to baseline only.")

@@ -51,7 +51,7 @@ class EnvConfig:
     map_res: float = 0.1                    # [m] cell resolution
     prior_known_ratio: float = 0.2        # fraction of cells to reveal as prior
     prior_noise_flip_prob: float = 0.01     # small fraction of prior cells flipped to simulate errors
-    episode_max_steps: int = 64  # max steps per episode
+    episode_max_steps: int = 400  # max steps per episode
     coverage_stop: float = 0.2
 
     # FoV rasterization
